@@ -35,8 +35,8 @@ struct kv_node {
 };
 
 /* Store life-cycle */
-void kv_init(void);
-void kv_cleanup(void);
+void __init kv_init(void);
+void __exit kv_cleanup(void);
 
 /* Store operations — all block-interruptibly as needed. */
 int kv_set(const char *key, const char *value);

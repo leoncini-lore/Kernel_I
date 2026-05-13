@@ -4,7 +4,7 @@ obj-m         := kvstore.o
 kvstore-objs  := dev.o store.o
 
 all:
-	make -C $(KERNEL_DIR) M=$(shell pwd) modules
+	$(MAKE) -C $(KERNEL_DIR) M=$(shell pwd) modules
 
 clean:
-	make -C $(KERNEL_DIR) M=$(shell pwd) clean
+	$(MAKE) -C $(KERNEL_DIR) M=$(shell pwd) clean

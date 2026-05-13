@@ -10,7 +10,7 @@ wait_queue_head_t kv_wq;
 unsigned int      num_entries;
 atomic_t          kv_gen;
 
-void kv_init(void)
+void __init kv_init(void)
 {
     mutex_init(&kv_mutex);
     init_waitqueue_head(&kv_wq);
@@ -19,7 +19,7 @@ void kv_init(void)
     atomic_set(&kv_gen, 0);
 }
 
-void kv_cleanup(void)
+void __exit kv_cleanup(void)
 {
     struct kv_node    *node;
     struct hlist_node *tmp;
@@ -37,10 +37,9 @@ void kv_cleanup(void)
 }
 
 /* Caller must hold kv_mutex. */
-static struct kv_node *kv_find(const char *key)
+static struct kv_node *kv_find(const char *key, u32 h)
 {
     struct kv_node *node;
-    u32 h = jhash(key, strlen(key), 0);
 
     hash_for_each_possible(kv_table, node, hnode, h) {
         if (strcmp(node->key, key) == 0)
@@ -57,7 +56,7 @@ int kv_set(const char *key, const char *value)
 {
     struct kv_node *node;
     char           *new_val;
-    u32             h;
+    u32             h = jhash(key, strlen(key), 0);
     unsigned int    gen;
     int             ret;
 
@@ -66,7 +65,7 @@ retry:
     if (ret)
         return ret;
 
-    node = kv_find(key);
+    node = kv_find(key, h);
     if (node) {
         /* Update: always allowed regardless of capacity. */
         new_val = kstrdup(value, GFP_KERNEL);
@@ -116,7 +115,6 @@ retry:
         mutex_unlock(&kv_mutex);
         return -ENOMEM;
     }
-    h = jhash(key, strlen(key), 0);
     hash_add(kv_table, &node->hnode, h);
     num_entries++;
     atomic_inc(&kv_gen);
@@ -129,20 +127,20 @@ retry:
 int kv_get(const char *key, char *out, size_t out_len)
 {
     struct kv_node *node;
+    u32 h = jhash(key, strlen(key), 0);
     int ret;
 
     ret = mutex_lock_interruptible(&kv_mutex);
     if (ret)
         return ret;
 
-    node = kv_find(key);
+    node = kv_find(key, h);
     if (!node) {
         mutex_unlock(&kv_mutex);
         return -ENOENT;
     }
 
-    strncpy(out, node->value, out_len - 1);
-    out[out_len - 1] = '\0';
+    strscpy(out, node->value, out_len);
     mutex_unlock(&kv_mutex);
     return 0;
 }
@@ -151,13 +149,14 @@ int kv_get(const char *key, char *out, size_t out_len)
 int kv_del(const char *key)
 {
     struct kv_node *node;
+    u32 h = jhash(key, strlen(key), 0);
     int ret;
 
     ret = mutex_lock_interruptible(&kv_mutex);
     if (ret)
         return ret;
 
-    node = kv_find(key);
+    node = kv_find(key, h);
     if (!node) {
         mutex_unlock(&kv_mutex);
         return -ENOENT;
@@ -186,6 +185,7 @@ int kv_del(const char *key)
 int kv_wait(const char *key, char *out, size_t out_len)
 {
     struct kv_node *node;
+    u32             h = jhash(key, strlen(key), 0);
     unsigned int    gen;
     int             ret;
 
@@ -194,10 +194,9 @@ int kv_wait(const char *key, char *out, size_t out_len)
         if (ret)
             return ret;
 
-        node = kv_find(key);
+        node = kv_find(key, h);
         if (node) {
-            strncpy(out, node->value, out_len - 1);
-            out[out_len - 1] = '\0';
+            strscpy(out, node->value, out_len);
             mutex_unlock(&kv_mutex);
             return 0;
         }
