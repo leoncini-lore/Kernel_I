@@ -33,12 +33,7 @@ struct kv_node {
     char              *key;
     char              *value;
     struct hlist_node  hnode;
-    /*
-     * Per-node wait queue reserved for future "wait-for-update" semantics.
-     * The current WAIT command (wait for existence) uses kv_waiter entries
-     * in kvstore_waiters instead; this field is initialised but not yet used.
-     */
-    wait_queue_head_t  wq;
+    /* No speculative fields: add wait-for-update support when actually needed. */
 };
 
 /*

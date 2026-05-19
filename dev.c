@@ -308,16 +308,26 @@ static int __init kvstore_init(void)
 static void __exit kvstore_exit(void)
 {
     /*
-     * Fix 1 — correct shutdown order to prevent use-after-free:
+     * Shutdown order (Issue 1 from prior review, comment refined by Issue 2):
      *
-     * 1. Deregister the device so no new commands can arrive.
-     *    fops.owner = THIS_MODULE blocks rmmod while any fd is open, so no
-     *    kv_wait() caller can be sleeping at this point in practice — but the
-     *    ordering below is the correct defensive pattern regardless.
+     * 1. Deregister the device: prevents new open() calls and new write()
+     *    commands on existing fds.
      *
-     * 2. Wake any tasks sleeping in kv_set() (table-full path) BEFORE
-     *    tearing down the table.  They will re-check under the mutex and
-     *    return -EINTR / -ERESTARTSYS, never touching freed nodes.
+     * 2. Wake kvstore_wq: this queue is used exclusively by kv_set() callers
+     *    blocked in the table-full capacity-wait path.  Those callers do not
+     *    hold a dedicated wait entry — they sleep on the global kvstore_wq —
+     *    so waking it here lets them re-check kvstore_gen and return cleanly
+     *    with -ERESTARTSYS before the table is torn down.
+     *
+     *    Note: kv_wait() callers sleep on per-key kv_waiter.wq entries, NOT
+     *    on kvstore_wq, so this wake does NOT reach them.  kv_cleanup() handles
+     *    the defensive wake of per-key entries separately.
+     *
+     *    In practice both kv_set() and kv_wait() callers hold an open fd while
+     *    sleeping, and fops.owner = THIS_MODULE plus the file_operations refcount
+     *    mean rmmod cannot succeed while any fd is open.  Therefore no sleeper
+     *    can be present at this point.  The wake is harmless and matches the
+     *    "wake before tear down" defensive pattern.
      *
      * 3. Tear down the hash table only after all sleepers have been woken.
      *

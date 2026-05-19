@@ -31,9 +31,26 @@ void __exit kv_cleanup(void)
 {
     struct kv_node    *node;
     struct hlist_node *tmp;
+    struct kv_waiter  *w;
     unsigned int       bkt;
 
     mutex_lock(&kvstore_mutex);
+
+    /*
+     * Issue 2 — defensive wake of per-key waiters:
+     * Module unload while a kv_wait() caller is sleeping is prevented in
+     * practice by THIS_MODULE refcounting (an open fd keeps the module
+     * pinned).  This loop is purely defensive: if that invariant ever breaks,
+     * sleeping callers are woken so they re-check and unwind cleanly rather
+     * than touching freed memory.  We do NOT free the entries here — the
+     * woken kv_wait() callers own their refcount decrements and will free
+     * entries themselves in their cleanup path.
+     */
+    list_for_each_entry(w, &kvstore_waiters, list) {
+        w->ready = 1;
+        wake_up_interruptible(&w->wq);
+    }
+
     hash_for_each_safe(kvstore_table, bkt, tmp, node, hnode) {
         hash_del(&node->hnode);
         kfree(node->key);
@@ -60,19 +77,31 @@ static struct kv_node *kv_find(const char *key, u32 h)
  * Insert or update <key, value>.  Blocks if the table is full and the key
  * does not already exist, waiting until a kv_del() creates a free slot.
  *
- * Fix 2: on new-key insertion, wakes only kv_waiter entries registered for
- * this exact key (O(waiters-for-key) instead of O(all-waiters)).
+ * Per-key wake (Issue 2): on new-key insertion, wakes only kv_waiter entries
+ * registered for this exact key (O(waiters-for-key) instead of O(all-waiters)).
  *
- * Fix 7: allocation failures use goto unwind instead of nested if blocks.
+ * Goto unwind (Issue 7 from prior review): allocation failures use labelled
+ * goto instead of nested if blocks.
  */
 int kv_set(const char *key, const char *value)
 {
     struct kv_node   *node;
     struct kv_waiter *w;
     char             *new_key, *new_val;
-    u32               h = jhash(key, strlen(key), 0);
+    u32               h;
     unsigned int      gen;
     int               ret;
+
+    /* Issue 4: self-enforcing API contract; handle_cmd already validates,
+     * but direct callers (future ioctl, kernel-internal use) must not bypass. */
+    if (!key || key[0] == '\0' || !value)
+        return -EINVAL;
+    if (strlen(key) > (size_t)kvstore_max_key_len)
+        return -ENAMETOOLONG;
+    if (strlen(value) > (size_t)kvstore_max_value_len)
+        return -EMSGSIZE;
+
+    h = jhash(key, strlen(key), 0);
 
 retry:
     ret = mutex_lock_interruptible(&kvstore_mutex);
@@ -129,15 +158,20 @@ retry:
 
     node->key   = new_key;
     node->value = new_val;
-    init_waitqueue_head(&node->wq);
     hash_add(kvstore_table, &node->hnode, h);
     kvstore_num_entries++;
     atomic_inc(&kvstore_gen);
 
     /*
-     * Fix 2: wake only the pending-waiter entry for this exact key.
-     * setting ready = 1 before wake_up ensures the condition is visible
-     * to wait_event_interruptible before it re-checks.
+     * Wake only the pending-waiter entry for this exact key.  Setting
+     * ready = 1 before wake_up ensures the condition is visible to
+     * wait_event_interruptible before it re-checks.
+     *
+     * Issue 5: safe to use list_for_each_entry (non-_safe variant) here
+     * because we only set ready and wake; entry removal happens in kv_wait's
+     * cleanup path, never inside this loop.  If a future change ever removes
+     * an entry inside this loop, switch to list_for_each_entry_safe and add
+     * a temporary cursor.
      */
     list_for_each_entry(w, &kvstore_waiters, list) {
         if (strcmp(w->key, key) == 0) {
@@ -163,9 +197,16 @@ err_unlock:
 int kv_get(const char *key, char *out, size_t out_len)
 {
     struct kv_node *node;
-    u32 h = jhash(key, strlen(key), 0);
+    u32 h;
     int ret;
 
+    /* Issue 4: self-enforcing API contract. */
+    if (!key || key[0] == '\0')
+        return -EINVAL;
+    if (strlen(key) > (size_t)kvstore_max_key_len)
+        return -ENAMETOOLONG;
+
+    h = jhash(key, strlen(key), 0);
     ret = mutex_lock_interruptible(&kvstore_mutex);
     if (ret)
         return ret;
@@ -185,9 +226,16 @@ int kv_get(const char *key, char *out, size_t out_len)
 int kv_del(const char *key)
 {
     struct kv_node *node;
-    u32 h = jhash(key, strlen(key), 0);
+    u32 h;
     int ret;
 
+    /* Issue 4: self-enforcing API contract. */
+    if (!key || key[0] == '\0')
+        return -EINVAL;
+    if (strlen(key) > (size_t)kvstore_max_key_len)
+        return -ENAMETOOLONG;
+
+    h = jhash(key, strlen(key), 0);
     ret = mutex_lock_interruptible(&kvstore_mutex);
     if (ret)
         return ret;
@@ -210,33 +258,52 @@ int kv_del(const char *key)
 }
 
 /*
- * Block until <key> is present in the table, then copy its value into
- * out[0..out_len).  Returns -EINTR/-ERESTARTSYS if interrupted by a signal.
+ * Block until <key> is present in the table and its value has been
+ * successfully observed by this caller, then copy it into out[0..out_len).
+ * Returns 0 on success, -EINTR/-ERESTARTSYS if interrupted by a signal.
  *
- * Fix 2 — per-key wait queues to eliminate thundering herd:
- *   The previous design used a single global kvstore_wq, so every kv_set()
- *   or kv_del() woke ALL waiters regardless of which key they waited on,
- *   causing O(N*M) wake/check/sleep cycles for N waiters and M unrelated
- *   writes.
+ * Issue 1 — loop-back on SET-then-DEL race:
+ *   The caller's contract is "block until the key is present and give me its
+ *   value."  If the key is inserted and then deleted before this caller can
+ *   observe it (i.e., kv_find returns NULL after the wake), we re-sleep rather
+ *   than returning -ENOENT.  Returning -ENOENT from a function whose entire
+ *   purpose is "wait for existence" would break the contract.
  *
- *   Now each unique missing key gets one kv_waiter entry in kvstore_waiters.
- *   Multiple callers waiting on the same key share that entry via refcount.
- *   kv_set() walks kvstore_waiters and wakes only entries matching the
- *   inserted key.  On wake, each caller decrements refcount; the last one
- *   removes and frees the entry.
+ *   Before re-sleeping, pending->ready is reset to 0 under the mutex so that
+ *   wait_event_interruptible does not spin: it checks the condition before
+ *   sleeping, so a stale ready == 1 would cause an immediate spurious return.
+ *
+ *   Race on reset: between setting ready = 0 and re-entering
+ *   wait_event_interruptible, another kv_set() may fire and set ready = 1
+ *   again.  That is safe — wait_event_interruptible checks the condition
+ *   before sleeping and returns immediately if it is already true.
+ *
+ * Per-key wait queues (from prior review):
+ *   Each unique missing key gets one kv_waiter entry in kvstore_waiters.
+ *   Multiple callers for the same key share it via refcount.  kv_set() wakes
+ *   only the matching entry, eliminating the O(N*M) thundering-herd of a
+ *   global wait queue.
  *
  * Mutex note: mutex_lock() (not mutex_lock_interruptible) is used in the
- * post-sleep cleanup path.  This is intentional: once wait_event_interruptible
- * returns (for any reason), the caller MUST decrement refcount and potentially
- * free the kv_waiter entry.  A signal arriving in cleanup would leak the entry.
- * The lock is held only briefly in this bounded cleanup section.
+ * post-sleep path.  Once wait_event_interruptible returns for any reason, the
+ * caller MUST decrement refcount (and potentially free the entry).  Using the
+ * interruptible variant here could leak the entry on a second signal.  The
+ * lock is held only briefly in this bounded cleanup section.
  */
 int kv_wait(const char *key, char *out, size_t out_len)
 {
     struct kv_node   *node;
     struct kv_waiter *w, *pending = NULL;
-    u32               h = jhash(key, strlen(key), 0);
+    u32               h;
     int               ret;
+
+    /* Issue 4: self-enforcing API contract. */
+    if (!key || key[0] == '\0')
+        return -EINVAL;
+    if (strlen(key) > (size_t)kvstore_max_key_len)
+        return -ENAMETOOLONG;
+
+    h = jhash(key, strlen(key), 0);
 
     ret = mutex_lock_interruptible(&kvstore_mutex);
     if (ret)
@@ -277,21 +344,33 @@ int kv_wait(const char *key, char *out, size_t out_len)
     pending->refcount++;
     mutex_unlock(&kvstore_mutex);
 
-    /* Sleep until kv_set() sets pending->ready = 1 for this key. */
-    ret = wait_event_interruptible(pending->wq, pending->ready);
+    for (;;) {
+        ret = wait_event_interruptible(pending->wq, pending->ready);
 
-    /*
-     * Cleanup: runs regardless of ret.  See mutex note in function comment.
-     */
-    mutex_lock(&kvstore_mutex);
-    pending->refcount--;
-    if (ret == 0) {
+        /* Must hold mutex for both the value read and the refcount update. */
+        mutex_lock(&kvstore_mutex);
+
+        if (ret != 0)
+            goto cleanup;   /* signal: unwind and return the error */
+
         node = kv_find(key, h);
-        if (node)
+        if (node) {
             strscpy(out, node->value, out_len);
-        else
-            ret = -ENOENT;  /* key was set then deleted before we re-locked */
+            goto cleanup;   /* success */
+        }
+
+        /*
+         * SET-then-DEL race: key was inserted then removed before we
+         * re-acquired the mutex.  Reset ready so wait_event_interruptible
+         * sleeps on the next iteration rather than returning immediately.
+         * See function comment for the concurrent-kv_set race analysis.
+         */
+        pending->ready = 0;
+        mutex_unlock(&kvstore_mutex);
     }
+
+cleanup:
+    pending->refcount--;
     if (pending->refcount == 0) {
         list_del(&pending->list);
         kfree(pending->key);
