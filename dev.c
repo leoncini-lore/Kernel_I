@@ -13,21 +13,32 @@ MODULE_AUTHOR("Lorenzo Leoncini");
 MODULE_DESCRIPTION("Bounded in-memory key/value store kernel module");
 MODULE_VERSION("1.0");
 
-int max_entries  = 64;
-int max_key_len  = 32;
-int max_value_len = 128;
+/* Fix 4: kvstore_ prefix on module parameters to avoid symbol-namespace pollution */
+int kvstore_max_entries  = 64;
+int kvstore_max_key_len  = 32;
+int kvstore_max_value_len = 128;
 
-module_param(max_entries,   int, 0444);
-MODULE_PARM_DESC(max_entries,   "Max number of key/value pairs (default 64)");
-module_param(max_key_len,   int, 0444);
-MODULE_PARM_DESC(max_key_len,   "Max key length in bytes (default 32)");
-module_param(max_value_len, int, 0444);
-MODULE_PARM_DESC(max_value_len, "Max value length in bytes (default 128)");
+module_param(kvstore_max_entries,   int, 0444);
+MODULE_PARM_DESC(kvstore_max_entries,   "Max number of key/value pairs (default 64)");
+module_param(kvstore_max_key_len,   int, 0444);
+MODULE_PARM_DESC(kvstore_max_key_len,   "Max key length in bytes (default 32)");
+module_param(kvstore_max_value_len, int, 0444);
+MODULE_PARM_DESC(kvstore_max_value_len, "Max value length in bytes (default 128)");
 
 /* ------------------------------------------------------------------ */
 /* Per-open-file state                                                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Fix 6 — response-buffer overwrite semantics:
+ *
+ * Each open file descriptor has exactly one response buffer.  Issuing a
+ * second command that produces a response (GET, WAIT) before read()ing the
+ * first response silently discards the earlier response; set_response()
+ * calls kfree() on the old buffer before installing the new one.
+ *
+ * read() returns 0 (EOF) immediately when no response is pending.
+ */
 struct kvstore_file {
     char   *resp;       /* Response buffer populated by GET / WAIT    */
     size_t  resp_len;   /* Bytes of valid data in resp                 */
@@ -89,7 +100,10 @@ static ssize_t kvstore_read(struct file *filp, char __user *ubuf,
 /* Internal helpers                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Store a response string (value + newline) in the per-file buffer. */
+/*
+ * Store a response string (value + newline) in the per-file buffer.
+ * Overwrites any previous unread response — see struct kvstore_file comment.
+ */
 static int set_response(struct kvstore_file *kf, const char *val)
 {
     size_t len = strlen(val);
@@ -117,6 +131,16 @@ static int set_response(struct kvstore_file *kf, const char *val)
  *   DEL <key>
  *   WAIT <key>
  *
+ * Fix 3 — tokenisation:
+ *   Tokens are separated by runs of spaces and/or tabs.  Leading whitespace
+ *   is stripped before parsing.  strsep() splits on any single space or tab;
+ *   we manually skip runs of whitespace between tokens to handle multiple
+ *   consecutive delimiters (e.g. "SET  foo bar" is valid).
+ *
+ *   Value capture: everything after the second whitespace run is taken as the
+ *   value, preserving embedded spaces (e.g. "SET key hello world" stores the
+ *   value "hello world").  Empty keys and empty verbs are rejected (-EINVAL).
+ *
  * Returns 0 on success, negative errno on error.
  * For GET and WAIT the result is stored in kf->resp for the next read().
  */
@@ -128,32 +152,40 @@ static int handle_cmd(struct kvstore_file *kf, char *line)
 
     /* Strip trailing whitespace and newlines. */
     p = line + strlen(line);
-    while (p > line && (*(p - 1) == '\n' || *(p - 1) == '\r' || *(p - 1) == ' '))
+    while (p > line && (*(p-1) == '\n' || *(p-1) == '\r' ||
+                        *(p-1) == ' '  || *(p-1) == '\t'))
         *(--p) = '\0';
 
-    /* Split into verb, key, value. */
-    verb = line;
-    p = strchr(line, ' ');
-    if (p) {
-        *p = '\0';
-        key = p + 1;
-    } else {
-        key = NULL;
-    }
+    /* Strip leading whitespace (Fix 3). */
+    while (*line == ' ' || *line == '\t')
+        line++;
 
-    value = NULL;
-    if (key) {
-        p = strchr(key, ' ');
-        if (p) {
-            *p = '\0';
-            value = p + 1;
-        }
-    }
+    /*
+     * Tokenise: strsep splits on one delimiter character; we skip runs of
+     * whitespace between tokens manually so consecutive spaces/tabs work.
+     */
+    p    = line;
+    verb = strsep(&p, " \t");
+    while (p && (*p == ' ' || *p == '\t'))
+        p++;
+
+    key = strsep(&p, " \t");
+    while (p && (*p == ' ' || *p == '\t'))
+        p++;
+
+    /* Capture the rest of the line as value (preserves embedded spaces). */
+    value = (p && *p) ? p : NULL;
+
+    /* Reject empty verb or key (Fix 3). */
+    if (!verb || verb[0] == '\0')
+        return -EINVAL;
+    if (key && key[0] == '\0')
+        key = NULL;
 
     /* Validate lengths before touching the store. */
-    if (key && strlen(key) > (size_t)max_key_len)
+    if (key && strlen(key) > (size_t)kvstore_max_key_len)
         return -EINVAL;
-    if (value && strlen(value) > (size_t)max_value_len)
+    if (value && strlen(value) > (size_t)kvstore_max_value_len)
         return -EINVAL;
 
     if (strcmp(verb, "SET") == 0) {
@@ -164,10 +196,10 @@ static int handle_cmd(struct kvstore_file *kf, char *line)
     } else if (strcmp(verb, "GET") == 0) {
         if (!key)
             return -EINVAL;
-        valbuf = kmalloc((size_t)max_value_len + 1, GFP_KERNEL);
+        valbuf = kmalloc((size_t)kvstore_max_value_len + 1, GFP_KERNEL);
         if (!valbuf)
             return -ENOMEM;
-        ret = kv_get(key, valbuf, (size_t)max_value_len + 1);
+        ret = kv_get(key, valbuf, (size_t)kvstore_max_value_len + 1);
         if (ret == -ENOENT)
             ret = set_response(kf, "(not found)");
         else if (ret == 0)
@@ -183,10 +215,10 @@ static int handle_cmd(struct kvstore_file *kf, char *line)
     } else if (strcmp(verb, "WAIT") == 0) {
         if (!key)
             return -EINVAL;
-        valbuf = kmalloc((size_t)max_value_len + 1, GFP_KERNEL);
+        valbuf = kmalloc((size_t)kvstore_max_value_len + 1, GFP_KERNEL);
         if (!valbuf)
             return -ENOMEM;
-        ret = kv_wait(key, valbuf, (size_t)max_value_len + 1);
+        ret = kv_wait(key, valbuf, (size_t)kvstore_max_value_len + 1);
         if (ret == 0)
             ret = set_response(kf, valbuf);
         kfree(valbuf);
@@ -205,8 +237,14 @@ static ssize_t kvstore_write(struct file *filp, const char __user *ubuf,
                              size_t count, loff_t *ppos)
 {
     struct kvstore_file *kf = filp->private_data;
-    /* "SET " (4) + key + " " (1) + value + "\n" (1) */
-    size_t max_cmd = (size_t)(4 + 1 + max_key_len + 1 + max_value_len + 2);
+    /*
+     * Fix 5 — correct size bound:
+     *   <verb (≤4 chars)> ' ' <key (≤max_key_len)> ' ' <value (≤max_value_len)>
+     *   '\n' '\0'
+     * "WAIT" is the longest verb (4 chars + 1 space = 5 prefix bytes).
+     * SET is the longest command overall because it carries both key and value.
+     */
+    size_t max_cmd = (size_t)(5 + kvstore_max_key_len + 1 + kvstore_max_value_len + 2);
     char  *kbuf;
     int    ret;
 
@@ -263,20 +301,32 @@ static int __init kvstore_init(void)
     }
 
     pr_info("kvstore: loaded (max_entries=%d, max_key_len=%d, max_value_len=%d)\n",
-            max_entries, max_key_len, max_value_len);
+            kvstore_max_entries, kvstore_max_key_len, kvstore_max_value_len);
     return 0;
 }
 
 static void __exit kvstore_exit(void)
 {
-    misc_deregister(&kvstore_miscdev);
-    kv_cleanup();
     /*
-     * Wake any processes still blocked in kv_wait() or kv_set().
-     * They will receive -EINTR / -ERESTARTSYS and should exit cleanly.
-     * NOTE: ensure no processes are blocked before running rmmod.
+     * Fix 1 — correct shutdown order to prevent use-after-free:
+     *
+     * 1. Deregister the device so no new commands can arrive.
+     *    fops.owner = THIS_MODULE blocks rmmod while any fd is open, so no
+     *    kv_wait() caller can be sleeping at this point in practice — but the
+     *    ordering below is the correct defensive pattern regardless.
+     *
+     * 2. Wake any tasks sleeping in kv_set() (table-full path) BEFORE
+     *    tearing down the table.  They will re-check under the mutex and
+     *    return -EINTR / -ERESTARTSYS, never touching freed nodes.
+     *
+     * 3. Tear down the hash table only after all sleepers have been woken.
+     *
+     * Previous (wrong) order: misc_deregister → kv_cleanup → wake_up.
+     * A task woken after kv_cleanup would dereference freed kv_node memory.
      */
-    wake_up_interruptible(&kv_wq);
+    misc_deregister(&kvstore_miscdev);
+    wake_up_interruptible(&kvstore_wq);
+    kv_cleanup();
     pr_info("kvstore: unloaded\n");
 }
 
