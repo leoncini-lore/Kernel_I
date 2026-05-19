@@ -1,0 +1,40 @@
+#!/bin/bash
+# kvstore-cli — shell wrapper for /dev/kvstore
+# Usage:
+#   kvstore-cli SET <key> <value>
+#   kvstore-cli GET <key>
+#   kvstore-cli DEL <key>
+#   kvstore-cli WAIT <key>
+
+DEV=/dev/kvstore
+
+if [ ! -w "$DEV" ]; then
+    echo "kvstore-cli: $DEV not writable (is the module loaded? do you need sudo?)" >&2
+    exit 1
+fi
+
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 {SET|GET|DEL|WAIT} <key> [value]" >&2
+    exit 2
+fi
+
+# Open the device read+write on fd 3 for the duration of one command.
+exec 3<>"$DEV"
+
+# Send the command. Capture stderr from the write so we can interpret errors.
+if ! echo "$*" >&3 2>/dev/null; then
+    rc=$?
+    exec 3<&-
+    case "$1" in
+        DEL) echo "(not found)" ;;
+        *)   echo "kvstore-cli: command failed (exit $rc)" >&2; exit $rc ;;
+    esac
+    exit 0
+fi
+
+# For commands that produce a response, read exactly one line back.
+case "$1" in
+    GET|WAIT) head -n 1 <&3 ;;
+esac
+
+exec 3<&-
