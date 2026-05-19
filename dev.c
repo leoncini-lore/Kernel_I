@@ -320,8 +320,9 @@ static void __exit kvstore_exit(void)
      *    with -ERESTARTSYS before the table is torn down.
      *
      *    Note: kv_wait() callers sleep on per-key kv_waiter.wq entries, NOT
-     *    on kvstore_wq, so this wake does NOT reach them.  kv_cleanup() handles
-     *    the defensive wake of per-key entries separately.
+     *    on kvstore_wq, so this wake does NOT reach them.  No separate wake is
+     *    needed for per-key entries: THIS_MODULE refcounting guarantees no
+     *    kv_wait() caller can be sleeping at this point (see kv_cleanup()).
      *
      *    In practice both kv_set() and kv_wait() callers hold an open fd while
      *    sleeping, and fops.owner = THIS_MODULE plus the file_operations refcount

@@ -31,25 +31,19 @@ void __exit kv_cleanup(void)
 {
     struct kv_node    *node;
     struct hlist_node *tmp;
-    struct kv_waiter  *w;
     unsigned int       bkt;
 
     mutex_lock(&kvstore_mutex);
 
     /*
-     * Issue 2 — defensive wake of per-key waiters:
-     * Module unload while a kv_wait() caller is sleeping is prevented in
-     * practice by THIS_MODULE refcounting (an open fd keeps the module
-     * pinned).  This loop is purely defensive: if that invariant ever breaks,
-     * sleeping callers are woken so they re-check and unwind cleanly rather
-     * than touching freed memory.  We do NOT free the entries here — the
-     * woken kv_wait() callers own their refcount decrements and will free
-     * entries themselves in their cleanup path.
+     * No wake of kvstore_waiters needed here.  A kv_wait() caller can only
+     * sleep while holding an open file descriptor, and fops.owner = THIS_MODULE
+     * prevents module unload while any fd is open — so kvstore_waiters is
+     * always empty at this point.  A "defensive" wake would be actively unsafe:
+     * woken waiters would block on kvstore_mutex (still held here), then
+     * acquire it only after kv_cleanup returns and module memory is freed,
+     * causing use-after-free on the mutex and on any kv_waiter entries.
      */
-    list_for_each_entry(w, &kvstore_waiters, list) {
-        w->ready = 1;
-        wake_up_interruptible(&w->wq);
-    }
 
     hash_for_each_safe(kvstore_table, bkt, tmp, node, hnode) {
         hash_del(&node->hnode);
@@ -119,6 +113,7 @@ retry:
         kfree(node->value);
         node->value = new_val;
         atomic_inc(&kvstore_gen);
+        /* Update path: existing-key updates are not a kv_wait trigger; no per-key wake. */
         wake_up_interruptible(&kvstore_wq);
         mutex_unlock(&kvstore_mutex);
         return 0;
@@ -175,7 +170,7 @@ retry:
      */
     list_for_each_entry(w, &kvstore_waiters, list) {
         if (strcmp(w->key, key) == 0) {
-            w->ready = 1;
+            WRITE_ONCE(w->ready, 1);
             wake_up_interruptible(&w->wq);
         }
     }
@@ -278,6 +273,17 @@ int kv_del(const char *key)
  *   again.  That is safe — wait_event_interruptible checks the condition
  *   before sleeping and returns immediately if it is already true.
  *
+ * Forward-progress note:
+ *   Under adversarial workloads (rapid SET/DEL churn on the same key, where
+ *   every kv_set wake is followed by a kv_del before this caller can acquire
+ *   the mutex), this loop can iterate without making observable progress.
+ *   The only termination guarantee in that case is signal delivery: a signal
+ *   to the waiting task causes wait_event_interruptible to return
+ *   -ERESTARTSYS, the loop exits via goto cleanup, and the caller can retry
+ *   or give up.  This matches the semantics of the original implementation
+ *   and is acceptable for a blocking wait primitive — userspace owns its
+ *   own scheduling fairness.
+ *
  * Per-key wait queues (from prior review):
  *   Each unique missing key gets one kv_waiter entry in kvstore_waiters.
  *   Multiple callers for the same key share it via refcount.  kv_set() wakes
@@ -338,7 +344,7 @@ int kv_wait(const char *key, char *out, size_t out_len)
         }
         init_waitqueue_head(&pending->wq);
         pending->refcount = 0;
-        pending->ready    = 0;
+        WRITE_ONCE(pending->ready, 0);
         list_add(&pending->list, &kvstore_waiters);
     }
     pending->refcount++;
@@ -365,7 +371,7 @@ int kv_wait(const char *key, char *out, size_t out_len)
          * sleeps on the next iteration rather than returning immediately.
          * See function comment for the concurrent-kv_set race analysis.
          */
-        pending->ready = 0;
+        WRITE_ONCE(pending->ready, 0);
         mutex_unlock(&kvstore_mutex);
     }
 
