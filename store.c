@@ -5,7 +5,7 @@
 #include <linux/list.h>
 #include "kvstore.h"
 
-/* Fix 4: kvstore_ prefix on all exported globals to avoid symbol-namespace pollution */
+/* Store globals — kvstore_ prefix keeps them out of the flat kernel symbol namespace. */
 DEFINE_HASHTABLE(kvstore_table, KVSTORE_BITS);
 struct mutex      kvstore_mutex;
 wait_queue_head_t kvstore_wq;
@@ -13,11 +13,12 @@ unsigned int      kvstore_num_entries;
 atomic_t          kvstore_gen;
 
 /*
- * Fix 2: pending-waiter list for kv_wait() callers blocked on missing keys.
+ * List of kv_waiter entries for keys not yet present in the table.
  * Protected by kvstore_mutex.  Static — only store.c touches this list.
  */
 static LIST_HEAD(kvstore_waiters);
 
+/* Initialise store globals.  Called once from kvstore_init() before device registration. */
 void __init kv_init(void)
 {
     mutex_init(&kvstore_mutex);
@@ -27,6 +28,7 @@ void __init kv_init(void)
     atomic_set(&kvstore_gen, 0);
 }
 
+/* Free all hash-table entries.  Called from kvstore_exit() after device deregistration. */
 void __exit kv_cleanup(void)
 {
     struct kv_node    *node;
@@ -71,11 +73,9 @@ static struct kv_node *kv_find(const char *key, u32 h)
  * Insert or update <key, value>.  Blocks if the table is full and the key
  * does not already exist, waiting until a kv_del() creates a free slot.
  *
- * Per-key wake (Issue 2): on new-key insertion, wakes only kv_waiter entries
- * registered for this exact key (O(waiters-for-key) instead of O(all-waiters)).
- *
- * Goto unwind (Issue 7 from prior review): allocation failures use labelled
- * goto instead of nested if blocks.
+ * On new-key insertion, only the kv_waiter entry for this exact key is woken
+ * (O(waiters-for-key) rather than O(all-waiters)).  Allocation failures unwind
+ * via labelled goto.
  */
 int kv_set(const char *key, const char *value)
 {
@@ -86,8 +86,8 @@ int kv_set(const char *key, const char *value)
     unsigned int      gen;
     int               ret;
 
-    /* Issue 4: self-enforcing API contract; handle_cmd already validates,
-     * but direct callers (future ioctl, kernel-internal use) must not bypass. */
+    /* Self-enforcing API contract: handle_cmd validates too, but direct callers
+     * (future ioctl, kernel-internal) must not bypass the check at this layer. */
     if (!key || key[0] == '\0' || !value)
         return -EINVAL;
     if (strlen(key) > (size_t)kvstore_max_key_len)
@@ -134,7 +134,7 @@ retry:
         goto retry;
     }
 
-    /* Insert new entry — goto unwind on allocation failure (Fix 7). */
+    /* Insert new entry; goto labels unwind allocations on failure. */
     node = kmalloc(sizeof(*node), GFP_KERNEL);
     if (!node) {
         ret = -ENOMEM;
@@ -158,15 +158,14 @@ retry:
     atomic_inc(&kvstore_gen);
 
     /*
-     * Wake only the pending-waiter entry for this exact key.  Setting
-     * ready = 1 before wake_up ensures the condition is visible to
-     * wait_event_interruptible before it re-checks.
+     * Wake only the pending-waiter entry for this exact key.  WRITE_ONCE
+     * on ready before wake_up_interruptible provides the ordering guarantee
+     * that wait_event_interruptible needs to observe the updated condition.
      *
-     * Issue 5: safe to use list_for_each_entry (non-_safe variant) here
-     * because we only set ready and wake; entry removal happens in kv_wait's
-     * cleanup path, never inside this loop.  If a future change ever removes
-     * an entry inside this loop, switch to list_for_each_entry_safe and add
-     * a temporary cursor.
+     * list_for_each_entry (non-_safe) is safe here: we only set ready and
+     * wake; removal happens in kv_wait's cleanup path, never in this loop.
+     * If a future change removes entries inside this loop, switch to
+     * list_for_each_entry_safe with a temporary cursor.
      */
     list_for_each_entry(w, &kvstore_waiters, list) {
         if (strcmp(w->key, key) == 0) {
@@ -195,7 +194,7 @@ int kv_get(const char *key, char *out, size_t out_len)
     u32 h;
     int ret;
 
-    /* Issue 4: self-enforcing API contract. */
+    /* Self-enforcing API contract; see kv_set() for rationale. */
     if (!key || key[0] == '\0')
         return -EINVAL;
     if (strlen(key) > (size_t)kvstore_max_key_len)
@@ -224,7 +223,7 @@ int kv_del(const char *key)
     u32 h;
     int ret;
 
-    /* Issue 4: self-enforcing API contract. */
+    /* Self-enforcing API contract; see kv_set() for rationale. */
     if (!key || key[0] == '\0')
         return -EINVAL;
     if (strlen(key) > (size_t)kvstore_max_key_len)
@@ -257,7 +256,7 @@ int kv_del(const char *key)
  * successfully observed by this caller, then copy it into out[0..out_len).
  * Returns 0 on success, -EINTR/-ERESTARTSYS if interrupted by a signal.
  *
- * Issue 1 — loop-back on SET-then-DEL race:
+ * Loop-back on SET-then-DEL race:
  *   The caller's contract is "block until the key is present and give me its
  *   value."  If the key is inserted and then deleted before this caller can
  *   observe it (i.e., kv_find returns NULL after the wake), we re-sleep rather
@@ -284,7 +283,7 @@ int kv_del(const char *key)
  *   and is acceptable for a blocking wait primitive — userspace owns its
  *   own scheduling fairness.
  *
- * Per-key wait queues (from prior review):
+ * Per-key wait queues:
  *   Each unique missing key gets one kv_waiter entry in kvstore_waiters.
  *   Multiple callers for the same key share it via refcount.  kv_set() wakes
  *   only the matching entry, eliminating the O(N*M) thundering-herd of a
@@ -303,7 +302,7 @@ int kv_wait(const char *key, char *out, size_t out_len)
     u32               h;
     int               ret;
 
-    /* Issue 4: self-enforcing API contract. */
+    /* Self-enforcing API contract; see kv_set() for rationale. */
     if (!key || key[0] == '\0')
         return -EINVAL;
     if (strlen(key) > (size_t)kvstore_max_key_len)

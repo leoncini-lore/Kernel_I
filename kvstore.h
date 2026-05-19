@@ -10,12 +10,12 @@
 
 #define KVSTORE_BITS 6          /* 2^6 = 64 hash buckets */
 
-/* Module parameters (defined in dev.c) — Fix 4: kvstore_ prefix to avoid symbol collision */
+/* Module parameters (defined in dev.c); kvstore_ prefix avoids symbol-namespace collision. */
 extern int kvstore_max_entries;
 extern int kvstore_max_key_len;
 extern int kvstore_max_value_len;
 
-/* Hash table and synchronisation primitives (defined in store.c) — Fix 4 */
+/* Hash table and synchronisation primitives (defined in store.c). */
 extern struct hlist_head kvstore_table[1 << KVSTORE_BITS];
 extern struct mutex      kvstore_mutex;
 extern wait_queue_head_t kvstore_wq;
@@ -37,13 +37,13 @@ struct kv_node {
 };
 
 /*
- * Fix 2 — per-key pending-waiter entry.
+ * Per-key pending-waiter entry, used by kv_wait() for keys not yet present.
  *
- * Created by the first kv_wait() caller for a key that does not yet exist.
- * Subsequent kv_wait() callers for the same key share the entry via refcount.
- * kv_set() sets ready = 1 and calls wake_up_interruptible() on the entry's wq
- * when the key is inserted.  Each woken waiter decrements refcount; the last
- * one removes the entry from kvstore_waiters and frees it.
+ * The first kv_wait() caller for a missing key allocates one of these and adds
+ * it to kvstore_waiters.  Subsequent callers for the same key increment its
+ * refcount and share the same entry.  When kv_set() inserts the key it sets
+ * ready = 1 and wakes the entry's wait queue.  Each woken caller decrements
+ * refcount; the last one removes the entry from the list and frees it.
  *
  * Protected by kvstore_mutex.
  */

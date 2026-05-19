@@ -13,7 +13,7 @@ MODULE_AUTHOR("Lorenzo Leoncini");
 MODULE_DESCRIPTION("Bounded in-memory key/value store kernel module");
 MODULE_VERSION("1.0");
 
-/* Fix 4: kvstore_ prefix on module parameters to avoid symbol-namespace pollution */
+/* Module parameters; kvstore_ prefix avoids symbol-namespace pollution. */
 int kvstore_max_entries  = 64;
 int kvstore_max_key_len  = 32;
 int kvstore_max_value_len = 128;
@@ -30,12 +30,12 @@ MODULE_PARM_DESC(kvstore_max_value_len, "Max value length in bytes (default 128)
 /* ------------------------------------------------------------------ */
 
 /*
- * Fix 6 — response-buffer overwrite semantics:
+ * Response-buffer semantics:
  *
  * Each open file descriptor has exactly one response buffer.  Issuing a
  * second command that produces a response (GET, WAIT) before read()ing the
- * first response silently discards the earlier response; set_response()
- * calls kfree() on the old buffer before installing the new one.
+ * first silently discards the earlier response; set_response() calls kfree()
+ * on the old buffer before installing the new one.
  *
  * read() returns 0 (EOF) immediately when no response is pending.
  */
@@ -131,7 +131,7 @@ static int set_response(struct kvstore_file *kf, const char *val)
  *   DEL <key>
  *   WAIT <key>
  *
- * Fix 3 — tokenisation:
+ * Tokenisation:
  *   Tokens are separated by runs of spaces and/or tabs.  Leading whitespace
  *   is stripped before parsing.  strsep() splits on any single space or tab;
  *   we manually skip runs of whitespace between tokens to handle multiple
@@ -156,7 +156,7 @@ static int handle_cmd(struct kvstore_file *kf, char *line)
                         *(p-1) == ' '  || *(p-1) == '\t'))
         *(--p) = '\0';
 
-    /* Strip leading whitespace (Fix 3). */
+    /* Strip leading whitespace. */
     while (*line == ' ' || *line == '\t')
         line++;
 
@@ -176,7 +176,7 @@ static int handle_cmd(struct kvstore_file *kf, char *line)
     /* Capture the rest of the line as value (preserves embedded spaces). */
     value = (p && *p) ? p : NULL;
 
-    /* Reject empty verb or key (Fix 3). */
+    /* Reject empty verb or empty key. */
     if (!verb || verb[0] == '\0')
         return -EINVAL;
     if (key && key[0] == '\0')
@@ -238,7 +238,7 @@ static ssize_t kvstore_write(struct file *filp, const char __user *ubuf,
 {
     struct kvstore_file *kf = filp->private_data;
     /*
-     * Fix 5 — correct size bound:
+     * Maximum command size:
      *   <verb (≤4 chars)> ' ' <key (≤max_key_len)> ' ' <value (≤max_value_len)>
      *   '\n' '\0'
      * "WAIT" is the longest verb (4 chars + 1 space = 5 prefix bytes).
@@ -308,7 +308,7 @@ static int __init kvstore_init(void)
 static void __exit kvstore_exit(void)
 {
     /*
-     * Shutdown order (Issue 1 from prior review, comment refined by Issue 2):
+     * Shutdown order:
      *
      * 1. Deregister the device: prevents new open() calls and new write()
      *    commands on existing fds.
