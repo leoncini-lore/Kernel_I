@@ -9,7 +9,7 @@
 #include "kvstore.h"
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Lorenzo Leoncini");
+MODULE_AUTHOR("Lorenzo Leoncini, Pietro Augusto Allesina");
 MODULE_DESCRIPTION("Bounded in-memory key/value store kernel module");
 MODULE_VERSION("1.0");
 
